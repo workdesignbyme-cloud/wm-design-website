@@ -3,7 +3,7 @@ const http=require('node:http'),crypto=require('node:crypto');
 const port=Number(process.env.PORT||3000);
 const pw=process.env.DASHBOARD_PASSWORD||'';
 if(pw.length<14){console.error('Set DASHBOARD_PASSWORD to 14+ characters in Render Environment');process.exit(1)}
-const hash=crypto.scryptSync(pw,'wm-cc-v1',64),sessions=new Map(),events=[],clients=new Set(),secret=process.env.LINE_CHANNEL_SECRET||'';
+const hash=crypto.scryptSync(pw,'wm-cc-v1',64),sessions=new Map(),events=[],clients=new Set(),secret=process.env.LINE_CHANNEL_SECRET||'',relaySecret=process.env.WM_RELAY_SECRET||'';
 function reply(res,status,data,headers={}){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff',...headers});res.end(JSON.stringify(data))}
 function cookie(req){return (req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('wm_token='))?.slice(9)}
 function authed(req){const s=sessions.get(cookie(req));if(!s)return false;if(s<Date.now()){sessions.delete(cookie(req));return false}return true}
@@ -14,12 +14,26 @@ const counts=new Map();
 function limit(ip){const n=Date.now(),v=counts.get(ip)||{n:0,t:n};if(n-v.t>60000){v.n=0;v.t=n}v.n++;counts.set(ip,v);return v.n>8}
 http.createServer(async(req,res)=>{try{const path=new URL(req.url,'http://local').pathname;res.setHeader('x-frame-options','DENY');res.setHeader('referrer-policy','no-referrer');res.setHeader('content-security-policy',"default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'");
 if(path==='/health')return reply(res,200,{ok:true});
+if(path==='/api/ingest/line'&&req.method==='POST'){
+if(relaySecret.length<24)return reply(res,503,{error:'Relay disabled'});
+const raw=await body(req),incoming=String(req.headers['x-wm-relay-signature']||'');
+const expected=crypto.createHmac('sha256',relaySecret).update(raw).digest('hex');
+if(incoming.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(incoming),Buffer.from(expected)))return reply(res,401,{error:'Invalid relay signature'});
+const p=JSON.parse(raw.toString('utf8'));
+if(p.kind!=='line_notice'||typeof p.id!=='string'||p.id.length>160)return reply(res,400,{error:'Invalid event'});
+if(!events.some(e=>e.id===p.id)){
+  events.unshift({id:p.id,source:'LINE',preview:p.type==='image'?'มีรูปภาพใหม่จากลูกค้า':'มีข้อความใหม่จากลูกค้า',at:new Date().toISOString(),reviewed:false});
+  events.length=Math.min(events.length,500);
+  for(const c of clients)try{c.write('event: update\n'+'data: {}\n\n')}catch{}
+}
+return reply(res,200,{ok:true});
+}
 if(path==='/webhook/line'&&req.method==='POST'){if(!secret)return reply(res,503,{error:'Not configured'});const raw=await body(req),mac=crypto.createHmac('sha256',secret).update(raw).digest(),sig=Buffer.from(req.headers['x-line-signature']||'','base64');if(sig.length!==mac.length||!crypto.timingSafeEqual(sig,mac))return reply(res,401,{error:'Invalid signature'});const p=JSON.parse(raw.toString());for(const e of p.events||[]){const id=e.webhookEventId||crypto.createHash('sha256').update(JSON.stringify(e)).digest('hex');if(!events.some(x=>x.id===id)){events.unshift({id,source:'LINE',preview:e.type==='message'?'มีข้อความเข้าใหม่ (ปกปิดเนื้อหา)':'เหตุการณ์ '+e.type,at:new Date().toISOString(),reviewed:false});events.length=Math.min(events.length,500)}}for(const c of clients)try{c.write('event: update\ndata: {}\n\n')}catch{}return reply(res,200,{ok:true})}
 if(path==='/api/login'&&req.method==='POST'){if(!origin(req)||limit(req.socket.remoteAddress))return reply(res,429,{error:'โปรดลองอีกครั้ง'});const p=JSON.parse((await body(req)).toString()),test=crypto.scryptSync(String(p.password||''),'wm-cc-v1',64);if(!crypto.timingSafeEqual(hash,test))return reply(res,401,{error:'รหัสผ่านไม่ถูกต้อง'});const token=crypto.randomBytes(32).toString('hex');sessions.set(token,Date.now()+43200000);return reply(res,200,{ok:true},{'set-cookie':'wm_token='+token+'; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200'})}
 if(path==='/api/logout'&&req.method==='POST'){sessions.delete(cookie(req));return reply(res,200,{ok:true},{'set-cookie':'wm_token=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0'})}
 if(path==='/'){res.writeHead(200,{'content-type':'text/html; charset=utf-8','cache-control':'no-store'});return res.end(html)}
 if(path.startsWith('/api/')){if(!authed(req))return reply(res,401,{error:'กรุณาเข้าสู่ระบบ'});if(req.method!=='GET'&&!origin(req))return reply(res,403,{error:'Origin mismatch'});
-if(path==='/api/state')return reply(res,200,{total:events.length,unread:events.filter(x=>!x.reviewed).length,events:events.slice(0,40),webhookConfigured:!!secret});
+if(path==='/api/state')return reply(res,200,{total:events.length,unread:events.filter(x=>!x.reviewed).length,events:events.slice(0,40),webhookConfigured:!!secret||relaySecret.length>=24,relayConfigured:relaySecret.length>=24});
 if(path==='/api/stream'){res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-store'});res.write(': ok\n\n');clients.add(res);req.on('close',()=>clients.delete(res));return}
 if(path==='/api/review'&&req.method==='POST'){const p=JSON.parse((await body(req)).toString()),e=events.find(x=>x.id===p.id);if(e)e.reviewed=true;return reply(res,200,{ok:!!e})}
 if(path==='/api/ask'&&req.method==='POST'){const p=JSON.parse((await body(req)).toString()),q=String(p.q||'').slice(0,300);const unread=events.filter(x=>!x.reviewed).length;let a=/line|ไลน์|สถานะ|เชื่อม/.test(q.toLowerCase())?('LINE Webhook '+(secret?'ตั้งค่า Secret แล้ว แต่ต้องทดสอบรับเหตุการณ์จริงค่ะ':'ยังไม่ตั้งค่า Secret ค่ะ')):/วันนี้|ภาพรวม|สรุป|งาน/.test(q)?('มีเหตุการณ์ LINE ที่เซิร์ฟเวอร์รับมา '+events.length+' รายการ และยังไม่ตรวจ '+unread+' รายการค่ะ แพลตฟอร์มอื่นยังไม่ใช่ข้อมูลสด'):/ข้อความ|แจ้งเตือน|ค้าง|ลูกค้า/.test(q)?('มีเหตุการณ์ LINE ที่ยังไม่ตรวจ '+unread+' รายการค่ะ ไม่ใช่ยอด DM ค้างทุกแอป'):'ฉันตรวจข้อมูล LINE Webhook และสรุปจำนวนเหตุการณ์ได้ค่ะ ข้อมูล Facebook และ TikTok ยังเป็นข้อมูลย้อนหลัง';return reply(res,200,{answer:a})}
